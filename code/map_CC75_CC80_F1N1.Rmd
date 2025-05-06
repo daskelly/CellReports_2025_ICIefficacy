@@ -1,0 +1,71 @@
+---
+title: "Mapping in CC12xCC80 CCF1"
+date: "Last updated `r format(Sys.time(), '%a %b %d %Y, %X %Z')`"
+output:
+  html_document:
+    code_download: true
+---
+
+```{r setup, message=FALSE}
+here::i_am("code/map_CC75_CC80_F1N1.Rmd",
+           uuid = "6025f6f1-5e44-4991-b15b-3cbabbd877c7")
+library(here)
+
+library(tidyverse)
+library(assertthat)
+library(qtl2)
+set.seed(1)
+```
+
+# Load data
+
+Load objects/data for QTL mapping:
+```{r}
+pr <- readRDS(here('figshare_data/CC75_CC80_F1N1_probs.rds'))
+K <- readRDS(here('figshare_data/CC75_CC80_F1N1_K.rds'))
+obj <- readRDS(here('figshare_data/CC75_CC80_F1N1_obj.rds'))
+assert_that(check_cross2(obj))
+```
+
+Next load the phenotypes
+```{r load_pheno}
+pheno <- read_tsv(here("data/CC75_CC80_F1N1_pheno.tsv"),
+                  show_col_types = FALSE)
+```
+
+
+## Map the phenotypes
+
+QTL map the phenotype.
+
+ * CR = no growth *ever*
+ * CR* = complete responder that showed initial growth but regressed to zero
+ * PR = partial responder that regressed to <1/2 maximum tumor volume
+ * NR = non-responder
+
+```{r mapping1}
+pdat <- filter(pheno, trt != 'isotype') |>
+    mutate(complete_responder=abbrev %in% c("CR", "CR*")) |>
+    separate(mouse_id, into = c(NA, 'suffix'), sep = '-') |>
+    rename(mouse_id = suffix) |>
+    as.data.frame() |> 
+    column_to_rownames('mouse_id')
+pheno_dat <- pdat[, c('log10_tumor_growth_slope', 'complete_responder'), 
+                  drop=FALSE]
+pheno_dat$complete_responder <- as.numeric(pheno_dat$complete_responder)
+```
+
+```{r, fig.width = 8, fig.height = 4}
+out <- scan1(pr, pheno_dat, K)
+attr(out, 'sample_size')
+plot(out, obj$gmap, lodcolumn = 'complete_responder')
+```
+
+```{r, fig.width = 8, fig.height = 4, eval = FALSE}
+operm <- scan1perm(genoprobs = pr, pheno = pheno_dat, kinship = K, 
+                   n_perm = 1000, cores = 6)
+thresh <- summary(operm)['0.05', 'complete_responder', drop = FALSE]
+plot(out, obj$gmap, lodcolumn = 'complete_responder', ylim = c(0, 10))
+abline(h = thresh, col = 'red', lty = 2)
+plot(out, obj$gmap, lodcolumn = 'complete_responder', add = TRUE)
+```
