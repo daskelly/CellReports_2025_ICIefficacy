@@ -1,0 +1,73 @@
+---
+title: "Map RTC in CCF1"
+date: "Last compiled `r format(Sys.time(), '%a %b %d %Y, %X %Z')`"
+output: 
+  html_document:
+    theme: sandstone
+---
+
+```{r setup, message=FALSE}
+here::i_am("code/map_CCF1.Rmd",
+           uuid = "ba911c02-f431-437b-9468-b66c35a78188")
+library(here)
+
+library(tidyverse)
+library(assertthat)
+library(qtl2)
+set.seed(2)
+```
+
+## Load data
+
+```{r}
+rtc <- read_tsv(here('data/rtc_avg.tsv'), show_col_types = FALSE)
+```
+
+Load objects/data for QTL mapping:
+```{r}
+pr <- readRDS(here('figshare_data/CCF1_probs.rds'))
+K <- readRDS(here('figshare_data/CCF1_K.rds'))
+obj <- readRDS(here('figshare_data/CCF1_obj.rds'))
+assert_that(check_cross2(obj))
+```
+
+Correct strain IDs
+```{r ids}
+ids <- tibble(full_id = ind_ids(obj)) %>%
+    separate(full_id, into = c("CC", NA), sep = "/", remove = FALSE) %>%
+    mutate(CC = gsub("CC0", "CC", CC)) %>%
+    select(CC, full_id) %>%
+    deframe()
+
+correct_ids <- function(m) {
+    assert_that(all(rownames(m) %in% names(ids)))
+    rownames(m) <- ids[rownames(m)]
+    m
+}
+
+to_map <- filter(rtc, cell_line == "MC38") %>%
+    select(-cell_line) %>%
+    filter(! grepl("^BALB", strain), ! grepl("^C57BL", strain)) %>%
+    separate(strain, into = c('strain', NA), sep = ' ') %>%
+    column_to_rownames('strain') %>%
+    correct_ids()
+assert_that(noNA(to_map))
+```
+
+## Do QTL mapping
+
+```{r, fig.width = 8, fig.height = 4}
+out <- scan1(genoprobs = pr, pheno = to_map, kinship = K)
+plot(out, obj$gmap)
+find_peaks(out, obj$gmap) |> filter(lod > 8)
+```
+
+```{r, fig.width = 8, fig.height = 4, eval = FALSE}
+# To define significance threshold:
+operm <- scan1perm(genoprobs = pr, pheno = to_map, kinship = K, 
+                   n_perm = 1000, cores = 6)
+thresh <- summary(operm, alpha = 0.05)['0.05', ]
+plot(out, obj$gmap, lodcolumn = 1, ylim = c(0, 10))
+abline(h = thresh[1], col = 'red', lty = 2)
+plot(out, obj$gmap, lodcolumn = 1, add = TRUE)
+```
