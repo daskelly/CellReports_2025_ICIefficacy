@@ -1,0 +1,222 @@
+---
+title: "Computing per-mouse rate-based T/C"
+date: "Last compiled `r format(Sys.time(), '%a %b %d %Y, %X %Z')`"
+output: 
+  html_document:
+    theme: sandstone
+---
+
+```{r setup, message=FALSE}
+here::i_am("code/compute_rtc.Rmd",
+           uuid = "3a79ff5f-0820-459a-9f6f-95512b7b1349")
+library(here)
+
+library(tidyverse)
+library(assertthat)
+library(conflicted)
+filter <- dplyr::filter
+set.seed(2)
+```
+
+## Load data
+
+```{r}
+log10_finite <- function(vals) ifelse(!is.finite(log10(vals)), NA, log10(vals))
+dat <- read_tsv(here('data/tumor_growth_data.tsv'),
+                show_col_types = FALSE) |>
+    mutate(log10_vol = log10_finite(tumor_vol_mm3))
+
+dat2 <- dat
+```
+
+## Setup and functions
+
+```{r}
+trimmed_slope <- function(df, measure, start_day = 7, end_day = Inf,
+                          min_n_measurements = 2) {
+
+    # Helper function for calculating slope
+    get_slope_mini <- function(this_dat, var_expr) {
+        var_sym <- rlang::ensym(var_expr)
+        
+        fitdat <- this_dat |>
+            filter(!is.na(!!var_sym), !is.na(study_day)) |>
+            arrange(study_day)
+        
+        if (nrow(fitdat) < 2) return(NA)  # not enough to fit a line
+        
+        # Create formula directly with quosure
+        lm1 <- lm(formula(paste0(rlang::as_name(var_sym), " ~ study_day")), data = fitdat)
+        return(coef(lm1)[2])
+    }
+    
+    # calculate slopes for each mouse
+    df2 <- filter(df, study_day >= start_day, study_day <= end_day) |>
+        group_by(study_id, cell_line, strain, trt, mouse_id) |>
+        mutate(n_measurements = n()) |>
+        nest() |>
+        mutate(slope = map(data, ~ get_slope_mini(this_dat = .x, var = {{ measure }}))) |>
+        unnest(c(data, slope)) |>
+        rename(measure_tumor_growth_slope = slope)
+    
+    # calculate control (isotype) means
+    ctrl_dat <- select(df2, mouse_id, strain, trt, cell_line,
+                       measure_tumor_growth_slope, study_id) |>
+        distinct() |>
+        filter(trt == "isotype") |>
+        group_by(study_id, strain, cell_line) |>
+        summarize(mean_isotype_measure_tumor_growth_slope =
+                      mean(measure_tumor_growth_slope, na.rm = TRUE),
+                  .groups = 'drop')
+
+    left_join(df2, ctrl_dat, by = join_by(study_id, cell_line, strain)) |>
+        group_by(study_id, cell_line, strain, trt, mouse_id) |>
+        mutate(n_measure_notNA = sum(!is.na({{ measure }}))) |>
+        mutate(RTC = 10^((measure_tumor_growth_slope -
+                              mean_isotype_measure_tumor_growth_slope) * 21)) |>
+        mutate(RTC = if_else(n_measurements < min_n_measurements, NA_real_, RTC)) |>
+        select(mouse_id, study_id, cell_line, strain, trt,
+               n_measurements, n_measure_notNA,
+               measure_tumor_growth_slope, RTC) |>
+        distinct()
+}
+```
+
+We originally mapped response after computing a per-mouse RTC by dividing 
+each aPD1 mouse's log slope by the mean isotype log slope.
+
+However, this approach posed a problem that was exemplified by strain CC11.
+Specifically, in the aPD1 group, all CC11 F1 mice grew tumors but they very
+quickly regressed to zero. For many CC11 aPD1 mice there was a single non-zero 
+measurement after day 7, but it went down to zero thereafter.
+These tumors were not counted in the original RTC metric, because they only 
+had a single data point therefore a line could not be fit to the growth curves.
+To address this, we took an empirical approach, reasoning that
+tumor growth is dramatically shrinking in these mice 
+(call them "rapidly shrinking" tumors). 
+First we compiled estimates of tumor growth slope in aPD1 and ISO
+groups for all mice. We then took the 10th percentile slopes in each group
+and replaced these values as an estimate of slope for 
+all of the "rapidly shrinking" tumors.
+
+In the function below, we compute RTC as in 
+[Hather et al 2014](https://pubmed.ncbi.nlm.nih.gov/25574127/).
+but using a per-mouse aPD1 slope and an isotype group mean slope. 
+For any tumors that are "rapidly shrinking" tumors as defined 
+above, we replaced the unavailable slope estimate with the empirical 10th
+percentiles (as above) and computed the RTC in the same manner.
+
+```{r}
+mark_first_postgrowth_zero <- function(df) {
+    # Mark the first zero tumor volume that occurs after the tumor has shown growth
+    
+    is_first_postgrowth_zero <- function(tumor_volumes, days) {
+        # Sort data by study day
+        sorted_data <- tibble(day = days, volume = tumor_volumes) |>
+            arrange(day)
+        
+        # Create a logical vector for zero volumes
+        is_zero <- sorted_data$volume == 0
+        result <- rep(FALSE, length(is_zero))
+        
+        # Case 1: No zeros at all - return all FALSE
+        if (!any(is_zero)) return(result)
+        
+        # Case 2: All zeros - return all FALSE (tumor never grew)
+        if (all(is_zero)) return(result)
+        
+        # Find first positive volume (evidence of tumor growth)
+        first_growth_idx <- min(which(sorted_data$volume > 0))
+        
+        # Check if any zeros occur after first growth
+        post_growth_zeros <- which(is_zero & seq_along(is_zero) > first_growth_idx)
+        
+        # If no zeros after growth, return all FALSE
+        if (length(post_growth_zeros) == 0) return(result)
+        
+        # Mark the first post-growth zero
+        result[post_growth_zeros[1]] <- TRUE
+        return(result)
+    }
+    
+    # Process all mice data
+    df |>
+        group_by(study_id, cell_line, strain, trt, mouse_id) |>
+        mutate(first_postgrowth_zero = is_first_postgrowth_zero(
+            tumor_vol_mm3, study_day
+        )) |>
+        ungroup() # Explicitly ungroup to avoid unexpected behavior
+}
+```
+
+```{r}
+rtc_replace_rapid_shrinkers <- function(df, slope_var, quantile_df) {
+    # Replace slope values for "rapid shrinking" tumors with predetermined
+    # quantile values
+    #
+    # Args:
+    #   df: Dataframe of tumor response data with an is_rapid_shrinker column
+    #   slope_var: The variable name (unquoted) containing slope values
+    #   quantile_df: A dataframe containing replacement values
+    
+    # Join with the quantile dataframe containing replacement values
+    df_with_quantiles <- df |>
+        left_join(quantile_df, by = join_by(trt, cell_line))
+    
+    # Calculate isotype control means using either original slopes
+    # or replacement values for rapid shrinkers
+    isotype_means <- df_with_quantiles |>
+        filter(trt == 'isotype') |>
+        ungroup() |>
+        mutate(adjusted_slope = if_else(is_rapid_shrinker, q10, {{ slope_var }})) |>
+        group_by(strain, cell_line, study_id) |>
+        summarize(
+            iso_mean_slope = mean(adjusted_slope, na.rm = TRUE), 
+            .groups = 'drop'
+        )
+    
+    # Calculate final RTC values for all samples using the study-specific control values
+    df_with_quantiles |>
+        ungroup() |>
+        mutate(adjusted_slope = if_else(is_rapid_shrinker, q10, {{ slope_var }})) |>
+        select(study_id, strain, cell_line, trt, mouse_id, adjusted_slope) |>
+        left_join(isotype_means, by = join_by(strain, cell_line, study_id)) |>
+        mutate(RTC = 10^((adjusted_slope - iso_mean_slope) * 21))
+}
+```
+
+## Do the RTC analysis
+
+```{r}
+# mark the mouse_id for tumors that are "rapidly shrinking" as defined above
+has_postgrowth_zero <- mark_first_postgrowth_zero(dat2) |>
+    group_by(study_id, strain, trt, cell_line, mouse_id) |>
+    summarize(has_pgz = any(first_postgrowth_zero), .groups = 'drop')
+
+# calculate RTC
+slopes <- trimmed_slope(dat2, measure = log10_vol)
+slopes2 <- ungroup(slopes) |>
+    mutate(one_point = n_measure_notNA == 1) |>
+    inner_join(has_postgrowth_zero) |>
+    mutate(is_rapid_shrinker = one_point & has_pgz)
+
+# get the 10th percentile for computed slopes for each trt group/cell line
+qq <- group_by(slopes, trt, cell_line) |>
+    summarize(q10 = quantile(measure_tumor_growth_slope, 0.1, na.rm = TRUE),
+              .groups = 'keep')
+
+rtc_per_mouse <- rtc_replace_rapid_shrinkers(slopes2, 
+                                             measure_tumor_growth_slope,
+                                             quantile_df = qq) |>
+    arrange(cell_line, strain, trt, mouse_id) |>
+    mutate(across(where(is.numeric), ~signif(., digits = 6)))
+write_tsv(rtc_per_mouse, file = here('data/rtc_permouse.tsv'))
+
+rtc <- rtc_per_mouse |>
+    filter(trt != 'isotype') |>
+    group_by(strain, cell_line) |>
+    summarize(mean_log_RTC = signif(mean(log(RTC), na.rm = TRUE), digits = 6),
+              .groups = 'keep') |>
+    arrange(cell_line, strain)
+write_tsv(rtc, file = here('data/rtc_avg.tsv'))
+```
