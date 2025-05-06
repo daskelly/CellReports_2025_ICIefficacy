@@ -2,3 +2,4 @@
 transfer_files.sh
 .Rproj.user
 *.html
+.DS_Store
