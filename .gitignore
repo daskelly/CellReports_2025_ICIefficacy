@@ -1,0 +1,4 @@
+*.Rproj
+transfer_files.sh
+.Rproj.user
+*.html
