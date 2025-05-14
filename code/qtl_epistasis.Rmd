@@ -1,0 +1,185 @@
+---
+title: "Look at epistatic interactions between QTL in CCF1N1 data"
+date: "Last updated `r format(Sys.time(), '%a %b %d %Y, %X %Z')`"
+output:
+  html_document:
+    code_download: true
+---
+
+```{r setup, include = TRUE, message = FALSE}
+library(tidyverse)
+library(assertthat)
+library(qtl2)
+library(lmtest)
+library(ggpubr)
+
+# uuid::UUIDgenerate()
+here::i_am("code/qtl_epistasis.Rmd", 
+           uuid = "cc84b62a-befc-4e84-bc8e-4dc5d3c570bc")
+library(here)
+set.seed(1)
+```
+
+In this document we model the fraction of complete responders using
+the three QTL (on chromosomes 5, 15, and 17)
+in order to look at epistatic interactions.
+
+
+Load CCF1N1 genotypes
+```{r}
+pr <- readRDS(here('figshare_data/CC75_CC80_F1N1_probs.rds'))
+K <- readRDS(here('figshare_data/CC75_CC80_F1N1_K.rds'))
+obj <- readRDS(here('figshare_data/CC75_CC80_F1N1_obj.rds'))
+assert_that(check_cross2(obj))
+```
+
+Load CCF1N1 phenotypes
+```{r ccf1n1_pheno}
+pheno <- read_tsv(here("data/CC75_CC80_F1N1_pheno.tsv"),
+                  show_col_types = FALSE) |>
+    mutate(complete_responder=abbrev %in% c("CR", "CR*"))|>
+    mutate(complete_responder = as.numeric(complete_responder))
+head(pheno, 2)
+
+pd1_pdat <- filter(pheno, trt != 'isotype') %>%
+    separate(mouse_id, into = c(NA, 'mouse_id'), sep = '-')
+iso_pdat <- filter(pheno, trt == 'isotype') %>%
+    separate(mouse_id, into = c(NA, 'mouse_id'), sep = '-')
+
+```
+
+
+```{r}
+get_ancestry <- function(chrom, start, end) {
+    g <- pull_genoprobint(pr, obj$pmap, chr = chrom, 
+                          interval = c(start, end))[[chrom]]
+    alleles <- dimnames(g)[[2]]
+    
+    ancestry <- list()
+    strains <- dimnames(g)[[1]]
+    for (i in 1:length(strains)) {
+        wmax <- apply(g[i, , ], 2, which.max)
+        ancestry[[strains[i]]] <- make_call(wmax, alleles = alleles)
+    }
+    anc <- unlist(ancestry) |> enframe('mouse_id', 'ancestry') |>
+        arrange(ancestry, mouse_id) |>
+        mutate(ancestry = case_when(ancestry == "BE" ~ "CC080",
+                                    ancestry == "BS" ~ "CC075",
+                                    TRUE ~ NA))
+}
+make_call <- function(nums, alleles) {
+    lett <- alleles[nums]
+    major <- sort(table(lett), decr = TRUE) %>% names() %>% `[`(1)
+    if (mean(lett == major) > 0.97) {
+        return(major)
+    } else {
+        return("undetermined")
+    }
+}
+```
+
+Get ancestries at Chr5 and Chr17 QTL.
+```{r ancestry}
+a5 <- get_ancestry('5', 29.2, 38.5) |> mutate(ancestry_qtl5 = ancestry)
+a17 <- get_ancestry('17', 34, 38) |> mutate(ancestry_qtl17 = ancestry)
+a15 <- get_ancestry('15', 75.9, 81.3) |> mutate(ancestry_qtl15 = ancestry)
+a <- select(a5, -ancestry) |>
+    inner_join(select(a17, -ancestry), by = 'mouse_id', suffix = c('5', '17')) |>
+    inner_join(select(a15, -ancestry), by = 'mouse_id') |>
+    mutate(missing = case_when(is.na(ancestry_qtl5) ~ TRUE,
+                               is.na(ancestry_qtl15) ~ TRUE,
+                               is.na(ancestry_qtl17) ~ TRUE,
+                               TRUE ~ FALSE))
+
+```
+
+```{r}
+adat <- inner_join(a, pd1_pdat)
+
+# Logistic regression to test for epistasis
+additive <- glm(complete_responder ~ ancestry_qtl5 + ancestry_qtl15 + 
+            ancestry_qtl17, data = adat, family = 'binomial')
+interaction <- glm(complete_responder ~ 
+            ancestry_qtl5*ancestry_qtl15*ancestry_qtl17, 
+          data = adat, family = 'binomial')
+lrtest(interaction, additive) %>% pull(`Pr(>Chisq)`) %>% `[`(2)
+```
+
+So interaction model is much preferred statistically over plain main
+effects additive model.
+
+Let's look at all the different effects.
+
+
+```{r}
+model_5_15 <- glm(complete_responder ~ ancestry_qtl5*ancestry_qtl15 + 
+                      ancestry_qtl17, data = adat, family = 'binomial')
+lrtest(model_5_15, additive) %>% pull(`Pr(>Chisq)`) %>% `[`(2)
+
+model_5_17 <- glm(complete_responder ~ ancestry_qtl5*ancestry_qtl17 + 
+                      ancestry_qtl15, data = adat, family = 'binomial')
+lrtest(model_5_17, additive) %>% pull(`Pr(>Chisq)`) %>% `[`(2)
+
+model_15_17 <- glm(complete_responder ~ ancestry_qtl5 + 
+                       ancestry_qtl15*ancestry_qtl17, data = adat, 
+                   family = 'binomial')
+lrtest(model_15_17, additive) %>% pull(`Pr(>Chisq)`) %>% `[`(2)
+```
+
+Plot by ancestry at Chr15 QTL
+```{r}
+plot_by_ancestry <- function(ancestry_df) {
+    # ancestry_df is a tibble with columns including 
+    #     mouse_id, ancestry, ancestry_qtl15
+    alldat <- pheno |>
+        separate(mouse_id, into=c(NA, 'mouse_id'), sep='-') |>
+        left_join(ancestry_df) |>
+        mutate(ancestryComboF = factor(ancestryCombo, 
+                                       c('Chr5 & Chr17\nResponder',
+                                         'Chr5 & Chr17\nNon-responder'))) |>
+        mutate(a15short = case_when(ancestry15 == "Responder" ~ "R",
+                                    ancestry15 == "Non-responder" ~ "NR",
+                                    TRUE ~ "NONE")) |>
+        mutate(a15shortF = factor(a15short, c("R", "NR"))) |>
+        filter(ancestry5_17 != 'undetermined', 
+               ancestry15 != 'undetermined')
+    
+    symbols <- list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, Inf), 
+                    symbols = c("****", "***", "**", "*", "n.s."))
+    cmp <- compare_means(complete_responder ~ a15shortF,
+                         group.by = 'ancestryComboF',
+                         data = alldat, method = 'wilcox.test',
+                         exact = FALSE, symnum.args = symbols)
+    p <- alldat |>
+        ggplot(aes(x = a15shortF,
+                   y = complete_responder, fill = ancestry15)) +
+        stat_summary(fun = mean, geom = "bar") +
+        stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+        facet_wrap(~ ancestryComboF, nrow = 1) +
+        theme_bw(base_size = 18, base_family = 'Arial') + ylim(0, 1) +
+        ylab("Fraction complete responder") + xlab("Chr15 ancestry") +
+        geom_bracket(data = cmp, aes(xmin = "R", xmax = "NR", 
+                                     y.position = 0.96, label = p.signif),
+                     inherit.aes = FALSE,
+                     tip.length = 0.01, label.size = 6) +
+        coord_cartesian(ylim = c(0, 1.05), clip = 'off') +
+        scale_fill_manual(values = c("Responder" = "#4dac26",
+                                     "Non-responder" = "#d01c8b"))
+}
+filter(a, ancestry_qtl5 == ancestry_qtl17) |>
+    mutate(ancestry5_17 = case_when(ancestry_qtl5 == 'undetermined' ~ ancestry_qtl5,
+                                    ancestry_qtl17 == 'undetermined' ~ ancestry_qtl17,
+                                    TRUE ~ paste0(ancestry_qtl5, ' ', ancestry_qtl17))) |>
+    mutate(ancestryCombo = case_when(ancestry5_17 == "CC075 CC075" ~
+                                         "Chr5 & Chr17\nResponder",
+                                     ancestry5_17 == "CC080 CC080" ~
+                                         "Chr5 & Chr17\nNon-responder",
+                                     TRUE ~ ancestry5_17)) |>
+    mutate(ancestry15 = case_when(ancestry_qtl15 == "CC075" ~ "Responder",
+                                 ancestry_qtl15 == "CC080" ~ "Non-responder",
+                                 TRUE ~ ancestry_qtl15)) |>
+    plot_by_ancestry(ancestry_df = _) + guides(fill = 'none')
+
+```
+
+
