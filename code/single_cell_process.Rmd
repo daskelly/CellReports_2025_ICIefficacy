@@ -1,0 +1,219 @@
+---
+title: "Analysis of scRNA-Seq data"
+date: "Last updated `r format(Sys.time(), '%a %b %d %Y, %X %Z')`"
+output: html_document
+---
+
+```{r setup, include = TRUE, message = FALSE}
+here::i_am("code/single_cell_process.Rmd", 
+           uuid = "65af7b05-1c7a-4c33-83d8-7090c303f451")
+library(here)
+library(tidyverse)
+library(Seurat)
+library(harmony)
+library(assertthat)
+#library(presto)   # for more efficient FindMarkers() wilcox.test
+library(Matrix)
+library(ggpubr)
+```
+
+# Load data
+
+We use the processed data available from NCBI GEO
+[link](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274421).
+
+```{r}
+mdat <- read_tsv(here("data/GSE274421_mf_scRNAseq_metadata.tsv.gz"),
+                 show_col_types = FALSE) |>
+    as.data.frame()
+x <- as(readMM(here("data/GSE274421_mf_scRNAseq.mtx.gz")), "CsparseMatrix")
+rownames(x) <- scan(here('data/GSE274421_mf_scRNAseq_genes.tsv.gz'), what = '')
+colnames(x) <- scan(here('data/GSE274421_mf_scRNAseq_barcodes.tsv.gz'), what = '')
+rownames(mdat) <- colnames(x)
+obj <- CreateSeuratObject(counts = x, meta.data = mdat)
+```
+
+# Processing and dimensionality reduction
+
+```{r}
+# First, load raw data into Seurat objects and merge into one
+# object -- `obj`
+responder <- c('B6' = 'intermediate', 'CC075' = 'R', 'CC001' = 'R', 
+               'CC002' = 'R', 'CC007' = 'intermediate', 
+               'CC080' = 'NR', 'CC079' = 'NR', 'CC036' = 'NR')
+obj$responder <- setNames(responder[as.character(obj$strain)], Cells(obj))
+
+cc.genes <- readLines(here("data/regev_lab_cell_cycle_genes_mm.fixed.txt"))
+s.genes <- cc.genes[1:43]
+g2m.genes <- cc.genes[44:98]
+
+obj <- NormalizeData(obj, normalization.method = "LogNormalize") |> 
+    PercentageFeatureSet(pattern = '^mt-', col.name = 'pct_counts_mt') |>
+    PercentageFeatureSet(pattern = "^Rpl|^Rps", col.name = 'pct_counts_ribo') |>
+    subset(subset = pct_counts_mt < 15 & pct_counts_ribo < 45) |>
+    FindVariableFeatures(selection.method = "vst", nfeatures = 2000) |>
+    CellCycleScoring(s.features = s.genes, g2m.features = g2m.genes, 
+                     set.ident = FALSE) |>
+    ScaleData(vars.to.regress = c("nCount_RNA", "pct_counts_mt", 
+                                  'pct_counts_ribo', "S.Score", "G2M.Score")) |>
+    RunPCA(verbose = FALSE, npcs = 100)
+ElbowPlot(obj)
+# visual examination of ElbowPlot
+num_pc <- 37
+ElbowPlot(obj, ndims = 60) + geom_vline(xintercept = num_pc)
+
+obj <- FindNeighbors(obj, reduction = 'pca', dims = 1:num_pc, verbose = FALSE) |>
+  FindClusters(verbose = FALSE, resolution = 0.05) |>
+  RunUMAP(reduction = 'pca', dims = 1:num_pc, verbose = FALSE)
+obj$global_cluster_num_not_batch_corrected <- as.character(obj$seurat_clusters)
+```
+
+Use `harmony` to correct across processing date
+```{r harmony}
+obj <- RunHarmony(obj, group.by.vars = 'dataset', 
+    theta = 1, dims.use = 1:num_pc, max_iter = 100) |>
+    FindNeighbors(reduction = 'harmony', dims = 1:num_pc) |>
+    FindClusters(verbose = FALSE, resolution = 0.1) |>
+    RunUMAP(dims = 1:num_pc, reduction = 'harmony')
+obj$global_cluster_date_corrected <- as.character(obj$RNA_snn_res.0.1)
+```
+
+Clusters given in NCBI GEO data include subcluster numbers as well.
+Let's label major clusters with names:
+ 
+```{r naming2}
+nm2 <- c('0' = 'monomac', '1' = 'T/NK cells', '2' = 'cDC2', 
+         '3' = 'monomac', '4' = 'proliferating monomac', '5' = 'T/NK cells',
+         '6' = 'MC38', '7' = 'cDC1', '8' = 'pDC/B cells', 
+         '9' = 'CAF', '10' = 'gMDSC')
+obj$cluster_name <- setNames(nm2[obj$global_cluster_date_corrected],
+                             Cells(obj))
+UMAPPlot(obj, label = T, label.size = 5, group.by = 'cluster_name') + 
+    NoLegend() + xlab("UMAP 1") + ylab("UMAP 2")
+```
+
+Subclustering was conducted in a similar manner.
+
+# Examine subcluster differences
+
+```{r}
+theme_this <- function(base_size = 18) { 
+    theme_bw(base_size = base_size, base_family = 'Arial') +
+    theme(axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(),
+          panel.grid = element_blank(),
+          panel.spacing = unit(0, 'null'),
+          plot.title = ggtext::element_markdown(hjust = 1, size = base_size),
+          strip.background = element_rect(fill = "white"),
+          strip.text = ggtext::element_markdown(size = base_size))
+}
+
+symbols <- list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, Inf), 
+                symbols = c("****", "***", "**", "*", "n.s."))
+
+```
+
+Compute signature of IFNg stimulation
+```{r}
+ifng_genes <- c("Ccl5", "Cd27", "Cd274", "Cd276", "Cd8a", "Cmklr1", "Cxcl9",
+                "Cxcr6", "H2-Aa", "H2-Eb1", "H2-T23", "Ido1", "Lag3", "Nkg7",
+                "Pdcd1lg2", "Psmb10", "Stat1", "Tigit")
+obj <- AddModuleScore(obj, features = list(IFNg = ifng_genes), 
+                      name = "IFNg", seed = 1)
+noI <- subset(obj, responder != 'intermediate')
+
+```
+
+```{r}
+sfrac <- select(obj@meta.data, dataset, treatment, mouseID, strain, 
+                responder, cluster) %>%
+    group_by(across(-cluster)) %>%
+    mutate(N_tot = n()) %>%
+    group_by(pick(everything())) %>%
+    summarize(n_clust = n(), .groups = 'keep') 
+toplot <- filter(sfrac, cluster %in% c(3, 13)) %>%
+    mutate(frac = n_clust / N_tot) %>%
+    filter(responder != 'intermediate') %>%
+    mutate(R = ifelse(responder == 'R', 'Responder', 'Non-responder')) %>%
+    mutate(condr = interaction(treatment, responder)) %>%
+    mutate(condrF = factor(condr, levels = c('isotype.NR', 'isotype.R',
+                                             '\u03b1PD1.NR', '\u03b1PD1.R'))) %>%
+    mutate(clusterN = case_when(cluster == 3 ~ "Exhausted CTLs",
+                                cluster == 13 ~ "IFN\u03b3<sup>+</sup> CTLs",
+                                TRUE ~ 'missing'))
+
+```
+
+```{r}
+filter(toplot, cluster == 3) %>%
+    ggplot(aes(x = R, y = 100*frac)) +
+    geom_violin(aes(fill = R), alpha = 0.4, width = 0.75) +
+    scale_discrete_manual(values = c('Responder' = '#4dac26', 
+                                     'Non-responder' = '#d01c8b'),
+                          aesthetics = c('color', 'fill')) +
+    geom_point(aes(color = R), 
+               position = position_jitter(width = 0.05, seed = 1)) +
+    theme_this(base_size = 24) +
+    facet_wrap(~ treatment, strip.position = 'bottom') +
+    guides(color = 'none', fill = guide_legend(reverse = TRUE)) +
+    stat_compare_means(comparisons = list(1:2, 3:4),
+                       symnum.args = symbols,
+                       vjust = 0, size = 6) +
+    scale_y_log10(expand = expansion(mult = c(0.25, 0.25))) +
+    xlab("") + ylab("Fraction cells") +
+    ggtitle("Exhausted CTLs (Subcluster 3)")
+
+filter(toplot, cluster == 13) %>%
+    ggplot(aes(x = R, y = 100*frac)) +
+    geom_violin(aes(fill = R), alpha = 0.4, width = 0.75) +
+    scale_discrete_manual(values = c('Responder' = '#4dac26', 
+                                     'Non-responder' = '#d01c8b'),
+                          aesthetics = c('color', 'fill')) +
+    geom_point(aes(color = R), 
+               position = position_jitter(width = 0.05, seed = 1)) +
+    theme_this(base_size = 24) +
+    facet_wrap(~ treatment, strip.position = 'bottom') +
+    guides(color = 'none', fill = guide_legend(reverse = TRUE)) +
+    stat_compare_means(comparisons = list(1:2, 3:4),
+                       symnum.args = symbols,
+                       vjust = 0, size = 6) +
+    scale_y_log10(expand = expansion(mult = c(0.25, 0.2))) +
+    xlab("") + ylab("Fraction cells") +
+    ggtitle("IFN\u03b3<sup>+</sup> CTLs (Subcluster 13)")
+```
+
+```{r}
+q75 <- quantile(noI$IFNg1, 0.75)
+noI$IFNg_top25 <- ifelse(noI$IFNg1 > q75, 'hi', 'lo')
+noI$mac2526_hiIFNg <- ifelse(noI$IFNg_top25 == 'hi' & 
+                                 noI$cluster %in% c(2, 5, 26), 
+                             'yes', 'no')
+sfrac <- select(noI@meta.data, dataset, treatment, mouseID, strain, 
+                responder, mac2526_hiIFNg) %>%
+    group_by(across(-mac2526_hiIFNg)) %>%
+    summarize(frac_2526_hiIFNg = mean(mac2526_hiIFNg == 'yes'),
+              .groups = 'keep')
+
+sfrac %>%
+    mutate(R = case_when(responder == 'R' ~ 'Responder',
+                         responder == 'NR' ~ 'Non-responder',
+                         TRUE ~ 'missing')) %>%
+    ggplot(aes(x = R, y = 100*frac_2526_hiIFNg)) +
+    geom_violin(aes(fill = R), alpha = 0.4, width = 0.75) +
+    scale_discrete_manual(values = c('Responder' = '#4dac26', 
+                                     'Non-responder' = '#d01c8b'),
+                          aesthetics = c('color', 'fill')) +
+    geom_point(aes(color = R), 
+               position = position_jitter(width = 0.05, seed = 1)) +
+    theme_this(base_size = 24) +
+    facet_wrap(~ treatment, strip.position = 'bottom') +
+    guides(color = 'none', fill = guide_legend(reverse = TRUE)) +
+    stat_compare_means(comparisons = list(1:2, 3:4), size = 6,
+                       vjust = 0, symnum.args = symbols,
+                       label.x.npc = 'center', label.y.npc = 'top') +
+    scale_y_log10(expand = expansion(mult = c(0.15, 0.15))) +
+    ylab("Fraction of all cells") +
+    coord_cartesian(ylim = c(2.5, 75), clip = 'off')
+```
+
+
