@@ -1,0 +1,24 @@
+name: Upload Repository to Figshare
+on:
+  workflow_dispatch:
+    
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+      
+      # Create a zip file preserving directory structure
+      - name: Create zip with directory structure
+        run: |
+          zip -r CellReports_2025_ICIefficacy.zip . -x ".git/*" ".github/*"
+          mkdir -p ./zip_output
+          mv CellReports_2025_ICIefficacy.zip ./zip_output/
+      
+      # Upload the zip file to Figshare
+      - uses: figshare/github-upload-action@v1.1
+        with:
+          FIGSHARE_TOKEN: ${{ secrets.FIGSHARE_TOKEN }}
+          FIGSHARE_ENDPOINT: 'https://api.figshare.com/v2'
+          FIGSHARE_ARTICLE_ID: 26583133
+          DATA_DIR: './zip_output'
