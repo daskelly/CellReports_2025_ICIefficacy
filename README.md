@@ -8,3 +8,7 @@ download the Figshare data from the
 item at https://doi.org/10.6084/m9.figshare.c.7398247
 and put it in the `figshare_data/` directory.
 
+Before running RNA-Seq code, download the
+processed files from NCBI GEO
+(links available at https://doi.org/10.6084/m9.figshare.c.7398247)
+and place them in the `data/` directory.
