@@ -1,0 +1,171 @@
+---
+title: "PCA on bulk RNA-Seq"
+date: "Last updated `r format(Sys.time(), '%a %b %d %Y, %X %Z')`"
+output:
+  html_document:
+    code_download: true
+---
+
+Before completing this script you should download processed matrices
+from 
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE273487
+and
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE273488,
+and put them in the 
+`data` directory.
+
+This uses both `edgeR` and `DESeq2` packages as somewhat of a historical
+accident. We had used `DESeq2` to find differentially expressed genes,
+but did PCA on `cpm` values from `edgeR` normalized data.
+
+```{r setup, message=FALSE}
+here::i_am("code/bulk_rnaseq_PCA.Rmd", 
+           uuid = "714e22d9-3e9a-4dbc-a21a-863c85017e3c")
+library(here)
+library(tidyverse)
+library(assertthat)
+library(conflicted)
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(sva))
+
+rename <- dplyr::rename
+filter <- dplyr::filter
+intersect <- base::intersect
+as.factor <- base::as.factor
+```
+
+```{r}
+norm_edgeR <- function(mat) {
+    y <- DGEList(counts = mat)
+    keep <- filterByExpr(y)
+    y <- y[keep, , keep.lib.sizes=FALSE]
+    y <- calcNormFactors(y)
+    y
+}
+```
+
+```{r loading_data}
+# Diverse strain data
+x <- read_tsv(here("data/GSE273487_R_NR_processed_matrix.tsv"),
+                            show_col_types = FALSE) |>
+    as.data.frame() |> column_to_rownames('ensembl_gene_id')
+x <- round(x)
+x <- as.matrix(x)
+mode(x) <- 'integer'
+
+# Blocking antibody experiment data
+y <- read_tsv(here("data/GSE273488_20240429_24-liu-003_processed_matrix.tsv"),
+                         show_col_types = FALSE) |>
+    as.data.frame() |> column_to_rownames('ensembl_gene_id')
+y <- round(y)
+y <- as.matrix(y)
+mode(y) <- 'integer'
+
+batch1_string <- "diverse strains expt"
+batch2_string <- "blocking Abs expt"
+mdat1 <- tibble(id = colnames(x)) |>
+    mutate(rep = as.integer(gsub("^.*rep ([12])$", "\\1", id))) |>
+    separate(id, into = c(NA, NA, NA, 'strain', NA, NA, 'trt'),
+             sep = ' ', extra = 'drop', remove = FALSE) |>
+    separate(strain, into = c('strain', NA), sep = '/') |>
+    mutate(mouse_id = 1:dplyr::n()) |>
+    mutate(batch = batch1_string) |>
+    mutate(responder = case_when(strain %in% c("CC001", "CC002", "CC075") ~ 'R',
+                                 strain %in% c("CC036", "CC079", "CC080") ~ "NR",
+                                 TRUE ~ "unknown"))
+mdat2 <- tibble(id = colnames(y)) |>
+    mutate(rep = as.integer(gsub("^.*rep ([0-9]+)$", "\\1", id))) |>
+    mutate(mouse_id = 1:dplyr::n()) |>
+    separate(id, into = c('strain', 'trt'), sep = ',', remove = FALSE) |>
+    separate(strain, into = c('strain', NA), sep = 'x') |>
+    separate(trt, into = c('trt', NA), sep = 'biol') |>
+    mutate(trt = trimws(trt)) |>
+    mutate(batch = batch2_string, responder = "R")
+
+assert_that(are_equal(mdat1$id, colnames(x)), 
+            are_equal(mdat2$id, colnames(y)))
+```
+
+Get R vs NR DEGs
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = x,
+                              colData = mdat1 |>
+                                  mutate(across(where(is.character), as.factor)),
+                              design = ~ responder)
+dds <- DESeq(dds, quiet = TRUE)
+res <- results(dds, contrast = c("responder", "NR", "R")) |>
+    as.data.frame() |>
+    rownames_to_column('gene') |>
+    select(gene, log2FoldChange, padj) |>
+    as_tibble()
+degs <- filter(res, !is.na(padj), padj < 0.05) |> pull(gene)
+```
+
+
+```{r}
+normx <- norm_edgeR(x)
+normy <- norm_edgeR(y)
+shared <- intersect(rownames(normx), rownames(normy)) %>%
+    intersect(degs)
+normx <- normx[shared, ]
+normy <- normy[shared, ]
+
+mat <- cbind(cpm(normx), cpm(normy))
+control_string <- "CC075 (R)"
+mdat <- rbind(select(mdat1, id, strain, trt, responder, batch), 
+              select(mdat2, id, strain, trt, responder, batch)) |>
+    mutate(grp = trt) |>
+    mutate(trt = case_when(grepl("^isotype", grp) ~ 'iso',
+                           grepl("^aPD1", grp) ~ 'aPD1',
+                           TRUE ~ "missing")) |>
+    mutate(xfact = case_when(batch == 'diverse strains expt' &
+                                 strain == "CC075" ~ control_string,
+                             batch == 'diverse strains expt' ~
+                                 paste0(strain, ' (', responder, ')'),
+                             batch == 'blocking Abs expt' &
+                                 grp %in% c('isotype control', 'aPD1') ~
+                                 control_string,
+                             grp == 'aPD1 + aGMCSF' ~ 'aGM-CSF',
+                             grp == 'aPD1 + aIL2RB' ~ 'aIL2RB',
+                             grp == 'aPD1 + aGMCSF + aIL2RB' ~ 'aIL2RB\n+ aGM-CSF',
+                             TRUE ~ 'missing'))
+                            
+assert_that(are_equal(mdat$id, colnames(mat)))
+```
+
+Use ComBat to normalize batch effects
+```{r, message = FALSE}
+dat <- log(mat + 1)
+exprComBat <- sva::ComBat(dat = dat, batch = mdat$batch, 
+                          mod = NULL, par.prior = TRUE, 
+                          prior.plots = FALSE)
+```
+
+
+Run PCA to compare the samples
+```{r pca}
+# PCA function based on plotPCA.DESeqTransform from
+# https://github.com/mikelove/DESeq2/blob/master/R/plots.R
+pc <- function(mat, metadata, hvg_vec = NULL) {
+    assert_that(are_equal(colnames(mat), metadata$id))
+    if (is.null(hvg_vec)) hvg_vec <- rownames(mat)
+    pca <- prcomp(t(mat[hvg_vec, ]), scale = TRUE, center = TRUE)
+    
+    # the contribution to the total variance for each component
+    percentVar <- pca$sdev^2 / sum( pca$sdev^2 )
+    
+    # assemble the data
+    d <- tibble(id = colnames(mat), PC1 = pca$x[,1], 
+                PC2 = pca$x[,2], PC3 = pca$x[,3], 
+                PC4 = pca$x[,4], PC5 = pca$x[,5])
+    attr(d, "percentVar") <- percentVar
+    left_join(d, metadata)
+}
+
+# Run PCA:
+p <- pc(exprComBat, mdat, hvg_vec = NULL)
+head(p)
+```
+
+
