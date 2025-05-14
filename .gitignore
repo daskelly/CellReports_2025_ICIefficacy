@@ -4,3 +4,4 @@ transfer_files.sh
 *.html
 .DS_Store
 *processed_matrix.tsv
+.Rhistory
