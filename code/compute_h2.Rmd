@@ -1,0 +1,107 @@
+---
+title: "Compute heritability"
+date: "Last updated `r format(Sys.time(), '%a %b %d %Y, %X %Z')`"
+output:
+html_document: default
+---
+  
+```{r setup, message = FALSE}
+here::i_am("code/compute_h2.Rmd",
+           uuid = "266c2415-09ea-4659-a1ec-c323176fd7fc")
+library(here)
+
+library(tidyverse)
+library(boot)
+set.seed(123)
+
+nboot_default <- 10000
+```
+
+Calculate heritability of per-mouse rate-based T/C.
+in genetically diverse CCF1 strains.
+
+
+```{r functions}
+# Transforms data to ranks and then to Z-scores via the normal quantile function
+rankZ <- function (x) {
+    x <- rank(x, na.last = "keep", ties.method = "average")/(sum(!is.na(x)) + 1)
+    qnorm(x)
+}
+
+# Computes heritability estimate based on strain variance components
+h2 <- function(tib, ind = 1:nrow(tib)) {
+    tib <- tib[ind, ]
+    model <- lm(RTC_z ~ strainF, data = tib)
+    anova_results <- as.data.frame(anova(model))
+    
+    # Calculate average group size
+    mean_n <- nrow(tib)/length(unique(tib$strainF))
+    
+    # Calculate heritability using variance components
+    strain_var <- anova_results['strainF', 'Mean Sq']
+    residual_var <- anova_results['Residuals', 'Mean Sq']
+    round(strain_var / (strain_var + ((mean_n - 1) * residual_var)), 4)
+}
+
+# Generate heritability estimate with shuffled strain labels
+shufH2 <- function(index, tib) {
+    shuffled_tib <- tib
+    shuffled_tib$strainF <- sample(tib$strainF)
+    tibble(index = index, heritability = h2(shuffled_tib))
+}
+
+# Compute heritability with confidence intervals and p-value
+compute_h2 <- function(this_cell_line, nboot = nboot_default) {
+    this_dat <- dat |>
+        filter(cell_line == this_cell_line, 
+               trt == "anti-PD1", 
+               !is.na(RTC)) |>
+        mutate(
+            RTC = pmin(RTC, 10),  # Cap RTC values at 10
+            strainF = factor(strain),
+            RTC_z = rankZ(RTC)    # Calculate Z scores
+        )
+    
+    # Calculate confidence intervals
+    h2.boot <- boot(data = select(this_dat, RTC_z, strainF), 
+                    statistic = h2, R = nboot)
+    boot.ci.out <- boot.ci(h2.boot, index = 1, type = c('bca'), conf = 0.95)
+    
+    
+    # p-value for test that heritability estimate is above chance. 
+    # In order to do this we shuffle strain labels and compute heritability.
+    set.seed(1)
+    shuf_h2 <- map_dfr(1:nboot, ~shufH2(.x, tib = this_dat))
+    pval <- signif(mean(shuf_h2$heritability > h2.boot$t0), 4)
+    if (pval == 0)  pval <- paste0("p < ", 1/nboot)
+    
+    # Return results
+    list(heritability = signif(h2.boot$t0, 4),
+         CI95 = c(signif(boot.ci.out$bca[4], 4),
+                  signif(boot.ci.out$bca[5], 4)),
+         pval = pval
+    )
+}
+```
+
+```{r}
+# Load phenotype data
+dat <- read_tsv(here('data/rtc_permouse.tsv'),
+                show_col_types = FALSE)
+
+# sample sizes table
+ungroup(dat) |>
+    select(cell_line, strain) |>
+    distinct() |>
+    count(cell_line) |>
+    knitr::kable()
+```
+
+Compute heritabilities
+
+```{r}
+compute_h2("MC38")
+compute_h2("AT3")
+compute_h2("CT26")
+compute_h2("EMT6")
+```
